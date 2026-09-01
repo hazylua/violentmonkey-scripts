@@ -791,6 +791,27 @@
             }
 
 
+            #poe-merc-modal button {
+                border: 1px solid #777;
+
+                background: #202020;
+                color: #eee;
+
+                padding: 8px 12px;
+
+                border-radius: 4px;
+
+                cursor: pointer;
+
+                font-size: 13px;
+            }
+
+
+            #poe-merc-modal button:hover {
+                background: #333;
+            }
+
+
             #${UI_ID} button.running {
                 background: #6b2525;
             }
