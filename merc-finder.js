@@ -193,7 +193,16 @@
     }
 
     function findMatch(row) {
+        /*
+            AND semantics: when multiple skill targets are
+            configured, a row only matches if every configured
+            target is present on the row (each on its own
+            mercenary skill mod, with its own required supports).
+        */
+
         const mods = getSkillMods(row);
+
+        const matches = [];
 
         for (const target of targets) {
 
@@ -205,6 +214,8 @@
             const wantedSupports = (target.supports || [])
                 .map(cleanSupportName)
                 .filter(Boolean);
+
+            let foundMod = null;
 
             for (const mod of mods) {
 
@@ -225,18 +236,26 @@
                 );
 
                 if (missing.length === 0) {
-
-                    return {
-                        target,
-                        skill: mod.skill,
-                        supports: mod.supports
-                            .map(cleanSupportName)
-                    };
+                    foundMod = mod;
+                    break;
                 }
             }
+
+            // This target was not satisfied by any mod on the row.
+            if (!foundMod)
+                return null;
+
+            matches.push({
+                target,
+                skill: foundMod.skill,
+                supports: foundMod.supports
+                    .map(cleanSupportName)
+            });
         }
 
-        return null;
+        return matches.length
+            ? matches
+            : null;
     }
 
 
@@ -286,11 +305,17 @@
         results.push({
             id,
 
-            skill: match.skill,
+            skill: match
+                .map(m => m.skill)
+                .join(' + '),
 
-            supports: match.supports,
+            supports: match.map(m =>
+                m.supports.length
+                    ? `${m.skill}: ${m.supports.join(', ')}`
+                    : `${m.skill}: No supports`
+            ),
 
-            target: match.target,
+            target: match.map(m => m.target),
 
             price: priceText(row),
 
