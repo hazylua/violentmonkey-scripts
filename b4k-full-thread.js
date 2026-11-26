@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         b4k Archive Full Thread
 // @namespace    b4k-full-thread
-// @version      1.0.0
+// @version      1.0.1
 // @description  Join the pages of large (truncated) threads on the b4k archive into one page, and make post links and quote previews work for them again.
 // @match        https://arch.b4k.co/*
 // @match        https://arch.b4k.dev/*
@@ -1470,7 +1470,14 @@
         const colors = getThemeColors();
         const viewWidth = document.documentElement.clientWidth;
 
-        popup.classList.add('b4kft-popup');
+        // #backlink is also FoolFuuka's preview box, which it positions in
+        // page coordinates. Keep its inline style so hidePopup can restore
+        // it; left as position: fixed, the site's next preview lands
+        // off-screen on a scrolled page.
+        if (!popup.classList.contains('b4kft-popup')) {
+            popup.dataset.b4kftStyle = popup.getAttribute('style') || '';
+            popup.classList.add('b4kft-popup');
+        }
         popup.replaceChildren(node);
         Object.assign(popup.style, {
             display: 'block',
@@ -1498,7 +1505,10 @@
 
     function hidePopup() {
         const popup = document.getElementById('backlink');
-        if (!popup) return;
+        if (!popup || !popup.classList.contains('b4kft-popup')) return;
+        popup.setAttribute('style', popup.dataset.b4kftStyle || '');
+        delete popup.dataset.b4kftStyle;
+        popup.classList.remove('b4kft-popup');
         popup.style.display = 'none';
         popup.replaceChildren();
     }
