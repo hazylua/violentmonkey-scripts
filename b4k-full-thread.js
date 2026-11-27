@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         b4k Archive Full Thread
 // @namespace    b4k-full-thread
-// @version      1.1.0
+// @version      1.1.1
 // @description  Join the pages of large (truncated) threads on the b4k archive into one page, and make post links and quote previews work for them again.
 // @match        https://arch.b4k.co/*
 // @match        https://arch.b4k.dev/*
@@ -53,6 +53,8 @@
     const CACHE_TTL_MS = 15 * 60 * 1000;
     const MEMORY_CACHE_ENTRIES = 40;
     const HOVER_DELAY_MS = 80;
+    // A request that hangs would leave a preview on "Loading…" for good.
+    const FETCH_TIMEOUT_MS = 30000;
 
     const ARCHIVE_HOSTS = ['arch.b4k.co', 'arch.b4k.dev'];
 
@@ -719,6 +721,10 @@
     const fetchLimit = createLimiter(FETCH_CONCURRENCY);
     const backgroundLimit = createLimiter(1, BACKGROUND_FETCH_GAP_MS);
 
+    function fetchWithTimeout(url) {
+        return fetch(url, { credentials: 'same-origin', signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    }
+
     async function fetchWithRetry(url) {
         let lastError = null;
 
@@ -727,7 +733,7 @@
 
             let res;
             try {
-                res = await fetch(url, { credentials: 'same-origin' });
+                res = await fetchWithTimeout(url);
             } catch (error) {
                 lastError = error;
                 continue;
@@ -1383,7 +1389,7 @@
         u.searchParams.set('num', key);
         if (vars.selected_theme) u.searchParams.set('theme', vars.selected_theme);
 
-        const res = await fetch(sameOriginUrl(u).href, { credentials: 'same-origin' });
+        const res = await fetchWithTimeout(sameOriginUrl(u).href);
         if (!res.ok) return null;
 
         const data = await res.json();
@@ -1600,17 +1606,51 @@
             zIndex: '10000',
             maxWidth: Math.min(900, viewWidth - 20) + 'px',
             background: colors.page,
+            // When a tall preview can't avoid the link, the cursor stays on
+            // the link instead of the popup.
+            pointerEvents: 'none',
         });
 
+        placePopup(popup, anchor);
+
+        // Images load after the popup is placed and can make it bigger.
+        for (const img of popup.querySelectorAll('img')) {
+            if (!img.complete) img.addEventListener('load', () => placePopup(popup, anchor), { once: true });
+        }
+    }
+
+    // Beside the link if it fits, else above or below it. The popup must not
+    // cover the link: the cursor would then be over the popup, the link
+    // would get mouseout, and the preview would hide and come back on every
+    // mouse move.
+    function placePopup(popup, anchor) {
+        if (!popup.classList.contains('b4kft-popup') || hover.link !== anchor) return;
+
+        const viewWidth = document.documentElement.clientWidth;
         const r = anchor.getBoundingClientRect();
         const width = popup.offsetWidth;
         const height = popup.offsetHeight;
+        const gap = 10;
+        const clamp = (v, min, max) => Math.min(Math.max(min, v), Math.max(min, max));
 
-        let left = r.right + 10;
-        if (left + width > viewWidth - 10) left = Math.max(10, r.left - width - 10);
+        let left;
+        let top;
+        if (r.right + gap + width <= viewWidth - gap) {
+            left = r.right + gap;
+        } else if (r.left - gap - width >= gap) {
+            left = r.left - gap - width;
+        }
 
-        let top = r.top + r.height / 2 - height / 2;
-        top = Math.min(Math.max(10, top), Math.max(10, innerHeight - height - 10));
+        if (left !== undefined) {
+            top = clamp(r.top + r.height / 2 - height / 2, gap, innerHeight - height - gap);
+        } else {
+            left = clamp(r.left, gap, viewWidth - width - gap);
+            const below = innerHeight - r.bottom - gap;
+            const above = r.top - gap;
+            top = below >= height || below >= above
+                ? r.bottom + 4
+                : Math.max(gap, r.top - 4 - height);
+        }
 
         popup.style.left = left + 'px';
         popup.style.top = top + 'px';
