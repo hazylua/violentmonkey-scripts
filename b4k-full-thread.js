@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         b4k Archive Full Thread
 // @namespace    b4k-full-thread
-// @version      1.0.1
+// @version      1.1.0
 // @description  Join the pages of large (truncated) threads on the b4k archive into one page, and make post links and quote previews work for them again.
 // @match        https://arch.b4k.co/*
 // @match        https://arch.b4k.dev/*
@@ -12,9 +12,11 @@
 /*
  * Thread pages: when the archive shows a "thread truncated" notice or splits a
  * thread into pages, every page is fetched and the replies are put back into
- * one page, in order. "Quoted By" backlinks are rebuilt across pages, links to
- * posts in the thread scroll to them instead of reloading, and the post in the
- * URL hash (#12345) is scrolled to once everything is in.
+ * one page, in order. On b4k, /board/thread/123/ answers "Threads this large
+ * can't be opened reliably" and links to /board/chunk/123/, whose pages are
+ * /board/chunk/123/500/N/. "Quoted By" backlinks are rebuilt across pages,
+ * links to posts in the thread scroll to them instead of reloading, and the
+ * post in the URL hash (#12345) is scrolled to once everything is in.
  *
  * Post pages (/board/post/123/): if the archive answers with the truncation
  * notice, go to the thread with #123 so the thread page can find the post.
@@ -55,11 +57,18 @@
     const ARCHIVE_HOSTS = ['arch.b4k.co', 'arch.b4k.dev'];
 
     // Text of the notice the archive shows on threads it won't render whole.
-    const NOTICE_RE = /truncat|paginat|too (?:many|large|big|long)|split (?:in|into) (?:\w+ )?pages/i;
+    // b4k shows a div.alert: "Error! Threads this large can't be opened
+    // reliably. Use the chunked method or view last 100 posts."
+    const NOTICE_RE = /threads? this (?:large|big|long)|can(?:no|'|’)t be opened|chunked method|truncat|paginat|too (?:many|large|big|long)|split (?:in|into) (?:\w+ )?pages/i;
 
-    // Elements whose text never holds that notice. Post bodies are the big one:
-    // people do write "truncated" in posts.
-    const NOTICE_SKIP = 'script, style, noscript, template, textarea, select, article.post, .text, #backlink, #b4kft-status, .b4kft-note';
+    // Elements whose text never holds that notice. Posts are the big one:
+    // people do write "truncated" in posts and subjects.
+    const NOTICE_SKIP = 'script, style, noscript, template, textarea, select, article, .text, #backlink, #b4kft-status, .b4kft-note';
+
+    // Path names of the archive's views of one thread. b4k splits large
+    // threads into /board/chunk/123/ (page 1) and /board/chunk/123/500/N/,
+    // where 500 is the number of posts per page.
+    const THREAD_VIEWS = ['thread', 'chunk'];
 
     const PAGE_PARAMS = ['page', 'p', 'pg'];
 
@@ -73,6 +82,11 @@
         'dd/mm/yy(ddd)HH:MM:ss',
         'yyyy-mm-dd HH:MM:ss',
     ];
+
+    // What FoolFuuka's board.js rewrites post times to on load. Used for
+    // imported posts when the page has no post times of its own to copy
+    // (b4k's "thread too large" page has no posts at all).
+    const FOOLFUUKA_TIME_FORMAT = 'ddd dd mmm yyyy HH:MM:ss';
 
     const STYLE_ID = 'b4kft-style';
     const STATUS_ID = 'b4kft-status';
@@ -194,9 +208,11 @@
         return `${location.origin}/${board}/thread/${thread}/`;
     }
 
+    const THREAD_PATH_RE = new RegExp(`^/([^/_][^/]*)/(${THREAD_VIEWS.join('|')})/(\\d+)(?:/|$)`);
+
     function parsePagePath(pathname) {
-        let m = pathname.match(/^\/([^/_][^/]*)\/thread\/(\d+)(?:\/|$)/);
-        if (m) return { kind: 'thread', board: m[1], thread: m[2] };
+        let m = pathname.match(THREAD_PATH_RE);
+        if (m) return { kind: 'thread', view: m[2], board: m[1], thread: m[3] };
 
         m = pathname.match(/^\/([^/_][^/]*)\/post\/(\d+(?:[_,]\d+)?)\/?$/);
         if (m) return { kind: 'post', board: m[1], key: normKey(m[2]) };
@@ -248,10 +264,16 @@
     }
 
     // The opening post's <article>, which also holds the replies.
+    function findOp(doc, thread) {
+        const el = findPostIn(doc, String(thread));
+        return el && !el.matches('article.post') ? el : null;
+    }
+
+    // The <article> holding the replies: the opening post, or on later pages
+    // of a split thread, an <article class="thread"> with no id. The
+    // .backlink_container one only holds the #backlink preview box.
     function findThreadArticle(doc, thread) {
-        const byId = doc.getElementById(String(thread));
-        if (byId && byId.tagName === 'ARTICLE' && !byId.matches('article.post')) return byId;
-        return doc.querySelector('article.thread');
+        return findOp(doc, thread) || doc.querySelector('article.thread:not(.backlink_container)');
     }
 
     function findReplies(root, thread) {
@@ -269,11 +291,27 @@
         return { op, replies: scope ? findReplies(scope, thread) : [] };
     }
 
+    // The post's <article>, skipping copies in the preview box and other
+    // elements with the same id (b4k adds a hidden <span id="123"> for the
+    // post in the URL hash).
     function findPostIn(doc, key, board) {
-        const el = doc.getElementById(key);
-        if (!el || el.tagName !== 'ARTICLE' || el.closest('#backlink')) return null;
-        if (board && el.dataset.board && el.dataset.board !== board) return null;
-        return el;
+        const ok = el => el.tagName === 'ARTICLE' && !el.closest('#backlink') &&
+            !(board && el.dataset.board && el.dataset.board !== board);
+
+        const first = doc.getElementById(key);
+        if (!first) return null;
+        if (ok(first)) return first;
+        return [...doc.querySelectorAll(`article[id="${key}"]`)].find(ok) || null;
+    }
+
+    // FoolFuuka puts a hidden "stub" before each reply, which takes the
+    // reply's place when someone hides it. It has to move with the reply.
+    function stubOf(post) {
+        const prev = post.previousElementSibling;
+        const docId = post.dataset.docId;
+        return prev && docId && prev.matches('.stub') && prev.classList.contains('stub_doc_id_' + docId)
+            ? prev
+            : null;
     }
 
     function replyRange(doc, thread) {
@@ -357,7 +395,8 @@
         return el;
     }
 
-    // The link in the notice that leads to the paginated thread.
+    // The link in the notice that leads to the paginated thread. On b4k that
+    // is /board/chunk/123/; the "last 100 posts" link next to it is skipped.
     function pickNoticeLink(notice, docUrl, board, thread) {
         let anchors = [...notice.querySelectorAll('a[href]')];
         if (notice.matches('a[href]')) anchors.unshift(notice);
@@ -376,10 +415,14 @@
 
             const segs = u.pathname.split('/').filter(Boolean);
             if (segs[0] !== board || !segs.includes(String(thread))) continue;
+            if (segs.includes('last')) continue;
             if (urlKey(u.href) === here) continue;
 
-            const paged = !!pageInfo(u, board, thread);
-            if (!best || (paged && !best.paged)) best = { url: sameOriginUrl(u).href, paged };
+            const p = parsePagePath(u.pathname);
+            const score = pageInfo(u, board, thread) ? 2
+                : p.kind === 'thread' && p.thread === String(thread) ? 1
+                : 0;
+            if (!best || score > best.score) best = { url: sameOriginUrl(u).href, score };
         }
 
         return best && best.url;
@@ -392,7 +435,9 @@
 
     // If `u` is one page of the thread, its page number and a URL template
     // with "{page}" where the number goes. Understands ?page=N / ?p=N and
-    // path forms such as /board/thread/123/N/, /page/N/ and /pN/.
+    // path forms such as /board/thread/123/N/, /page/N/ and /pN/. When the
+    // path has several numbers after the thread's, the page is the last one:
+    // b4k's /board/chunk/123/500/2/ is page 2 of 500 posts each.
     function pageInfo(u, board, thread) {
         if (!isArchiveHost(u.hostname)) return null;
 
@@ -419,7 +464,7 @@
             };
         }
 
-        for (let i = ti + 1; i < segs.length; i++) {
+        for (let i = segs.length - 1; i > ti; i--) {
             const m = segs[i].match(/^((?:p|page|pg)[-_]?)?(\d+)$/i);
             if (!m || !valid(Number(m[2]))) continue;
 
@@ -439,7 +484,7 @@
 
     function isBareThreadUrl(u, board, thread) {
         const segs = u.pathname.split('/').filter(Boolean);
-        return segs.length === 3 && segs[0] === board && segs[1] === 'thread' &&
+        return segs.length === 3 && segs[0] === board && THREAD_VIEWS.includes(segs[1]) &&
             segs[2] === String(thread) && !u.search;
     }
 
@@ -455,13 +500,15 @@
 
             const text = a.textContent.trim();
             const textNumber = /^\d+$/.test(text) ? Number(text) : null;
+            // The current page's link is marked, e.g. <li class="active">.
+            const active = textNumber !== null && !!a.closest('.active, .current, [aria-current]');
             const info = pageInfo(u, board, thread);
 
             if (info) {
-                links.push({ ...info, textNumber, el: a });
+                links.push({ ...info, textNumber, active, el: a });
             } else if (textNumber === 1 && isBareThreadUrl(u, board, thread)) {
                 // Page 1 is often just the plain thread URL.
-                links.push({ n: 1, url: sameOriginUrl(u).href, template: null, textNumber, el: a });
+                links.push({ n: 1, url: sameOriginUrl(u).href, template: null, textNumber, active, el: a });
             }
         }
 
@@ -475,6 +522,8 @@
             // False when link numbers aren't page numbers (e.g. post offsets),
             // so missing numbers can't be filled in from the template.
             gapFill: true,
+            // doc -> number of the page its pagination marks as current.
+            activePages: new WeakMap(),
 
             // Learns page URLs from a page's links. Returns false when the
             // page has no links to other pages.
@@ -495,6 +544,9 @@
                     if (!pager.urls.has(l.n)) pager.urls.set(l.n, l.url);
                 }
 
+                const active = links.find(l => l.active && (!l.template || l.template === pager.template));
+                if (active) pager.activePages.set(doc, active.n);
+
                 const own = pager.ownPageNumber(docUrl);
                 if (own !== null && !pager.urls.has(own)) {
                     pager.urls.set(own, sameOriginUrl(toUrl(docUrl)).href);
@@ -502,10 +554,14 @@
                 return true;
             },
 
-            ownPageNumber(docUrl) {
+            // The page number of a page, from its URL or else from the
+            // pagination's current-page marker (b4k's page 1 is /chunk/123/,
+            // while its link in the pagination is /chunk/123/500/1/).
+            ownPageNumber(docUrl, doc = null) {
                 const u = toUrl(docUrl);
                 const info = u && pageInfo(u, board, thread);
-                return info && info.template === pager.template ? info.n : null;
+                if (info && info.template === pager.template) return info.n;
+                return (doc && pager.activePages.get(doc)) ?? null;
             },
 
             numbers() {
@@ -544,7 +600,7 @@
 
         // The page we found the links on is page 1 if nothing says otherwise:
         // pagination usually links every page except the current one.
-        let firstNumber = pager.ownPageNumber(first.url);
+        let firstNumber = pager.ownPageNumber(first.url, first.doc);
         if (firstNumber === null) {
             if (!pager.urls.has(1)) pager.urls.set(1, sameOriginUrl(toUrl(first.url)).href);
             if (urlKey(pager.urls.get(1)) === urlKey(first.url)) firstNumber = 1;
@@ -828,6 +884,18 @@
             }
         }
 
+        // A post link into a split thread's page (/board/chunk/123/#456)
+        // only works on the page the post is on; the thread URL with the
+        // hash works for any of them.
+        for (const a of copy.querySelectorAll('a[href*="#"]')) {
+            const u = toUrl(a.getAttribute('href'), baseUrl);
+            if (!u || !isArchiveHost(u.hostname) || !hashKey(u.hash)) continue;
+            const p = parsePagePath(u.pathname);
+            if (p.kind === 'thread' && p.view !== 'thread') {
+                a.setAttribute('href', threadUrl(p.board, p.thread) + u.hash);
+            }
+        }
+
         // Thousands of thumbnails shouldn't all load at once.
         for (const img of copy.querySelectorAll('img')) {
             const lazySrc = img.getAttribute('data-src') || img.getAttribute('data-original');
@@ -852,6 +920,8 @@
                 node.remove();
             }
         }
+        // FoolFuuka localizes the times in its previews too.
+        fixImportedTimes([copy]);
         return copy;
     }
 
@@ -867,6 +937,9 @@
                 node.remove();
             }
         }
+
+        // The hide-post button; FoolFuuka's own preview drops it too.
+        for (const node of copy.querySelectorAll('.stub')) node.remove();
 
         copy.classList.remove('highlight', TARGET_CLASS);
         copy.style.display = '';
@@ -903,7 +976,7 @@
 
         let format = null;
         const samples = [...document.querySelectorAll('article time[datetime]')]
-            .filter(t => !t.closest('.' + IMPORTED_CLASS))
+            .filter(t => !t.closest('.' + IMPORTED_CLASS + ', #backlink'))
             .slice(0, 10);
 
         for (const t of samples) {
@@ -912,6 +985,13 @@
             const text = t.textContent.trim();
             format = TIME_FORMATS.find(f => formatTime(d, f) === text) || null;
             if (format) break;
+        }
+
+        // Nothing on the page to learn from: use FoolFuuka's format if its
+        // time rewriting is there.
+        const jq = window.jQuery;
+        if (!format && !samples.length && jq && jq.fn && typeof jq.fn.localize === 'function') {
+            format = FOOLFUUKA_TIME_FORMAT;
         }
 
         debug('time format', format);
@@ -945,40 +1025,59 @@
     // Posts already on the page are kept as they are and only moved.
     function mergePages(pages) {
         const { thread } = state;
+        const imported = [];
 
-        let op = findThreadArticle(document, thread);
+        // b4k's "thread too large" page has no posts at all, so the opening
+        // post comes from page 1.
+        let op = findOp(document, thread);
         if (!op) {
-            const page = pages.find(p => findThreadArticle(p.doc, thread));
-            if (!page) throw new Error('could not find the opening post on any page');
+            const page = pages.find(p => p.doc !== document && findOp(p.doc, thread));
+            if (page) {
+                op = importPost(findOp(page.doc, thread), page.url);
+                // Its replies are imported below with the other pages'.
+                for (const el of findReplies(op, thread)) {
+                    const stub = stubOf(el);
+                    if (stub) stub.remove();
+                    el.remove();
+                }
+                imported.push(op);
 
-            op = importPost(findThreadArticle(page.doc, thread), page.url);
-            const notice = findNotice(document);
-            if (notice && mainArea(document).contains(notice)) notice.after(op);
-            else mainArea(document).prepend(op);
+                const notice = findNotice(document);
+                if (notice && mainArea(document).contains(notice)) notice.after(op);
+                else mainArea(document).prepend(op);
+            } else {
+                op = findThreadArticle(document, thread);
+            }
+            if (!op) throw new Error('could not find the opening post on any page');
         }
 
         const container = ensureRepliesContainer(op);
+        // key -> [stub or null, reply]
         const posts = new Map();
 
         for (const el of findReplies(document.body, thread)) {
             const key = normKey(el.id);
-            if (!posts.has(key)) posts.set(key, el);
+            if (!posts.has(key)) posts.set(key, [stubOf(el), el]);
         }
 
-        const imported = [];
         for (const page of pages) {
             if (page.doc === document) continue;
             for (const el of collectPosts(page.doc, thread).replies) {
                 const key = normKey(el.id);
                 if (posts.has(key)) continue;
+                const stub = stubOf(el);
                 const copy = importPost(el, page.url);
-                posts.set(key, copy);
+                posts.set(key, [stub && document.importNode(stub, true), copy]);
                 imported.push(copy);
             }
         }
 
         const fragment = document.createDocumentFragment();
-        for (const key of [...posts.keys()].sort(compareKeys)) fragment.appendChild(posts.get(key));
+        for (const key of [...posts.keys()].sort(compareKeys)) {
+            for (const node of posts.get(key)) {
+                if (node) fragment.appendChild(node);
+            }
+        }
         container.appendChild(fragment);
 
         fixImportedTimes(imported);
@@ -1152,6 +1251,7 @@
 
             const { replies } = mergePages(result.pages);
             state.built = true;
+            getPopup();
             hidePageChrome();
             showNote(result.pages.length, replies);
 
@@ -1299,13 +1399,19 @@
     }
 
     // Works out a post's thread from /board/post/N/, which either redirects to
-    // the thread or shows the truncation notice with a link to it.
+    // the thread or shows the truncation notice with a link to it. b4k
+    // answers 200 with <meta http-equiv="refresh" content="0; url=...">.
     async function threadOfPost({ board, key }) {
         const page = await getPage(`${location.origin}/${board}/post/${key}/`);
 
-        const finalUrl = toUrl(page.url);
-        const p = finalUrl ? parsePagePath(finalUrl.pathname) : { kind: 'other' };
-        if (p.kind === 'thread' && p.board === board) return p.thread;
+        const refresh = page.doc.querySelector('meta[http-equiv="refresh" i]');
+        const refreshUrl = refresh && (refresh.getAttribute('content') || '').match(/url\s*=\s*['"]?([^'"\s]+)/i);
+
+        for (const href of [refreshUrl && refreshUrl[1], page.url]) {
+            const u = href && toUrl(href, page.url);
+            const p = u && isArchiveHost(u.hostname) ? parsePagePath(u.pathname) : { kind: 'other' };
+            if (p.kind === 'thread' && p.board === board) return p.thread;
+        }
 
         const notice = findNotice(page.doc);
         if (notice) return threadLinkIn(notice.parentElement || notice, board, page.url);
@@ -1455,12 +1561,19 @@
         return themeColors;
     }
 
+    // #backlink is the preview box. FoolFuuka's hover handler writes into it
+    // and does nothing without it, and b4k's "thread too large" page leaves
+    // it out. Same markup as on the archive's other pages.
     function getPopup() {
         let popup = document.getElementById('backlink');
         if (!popup) {
+            const container = document.createElement('article');
+            container.className = 'clearfix thread backlink_container';
             popup = document.createElement('div');
             popup.id = 'backlink';
-            document.body.appendChild(popup);
+            popup.style.cssText = 'position: absolute; top: 0; left: 0; z-index: 5;';
+            container.appendChild(popup);
+            mainArea(document).appendChild(container);
         }
         return popup;
     }
@@ -1766,7 +1879,11 @@
 
         const here = parsePagePath(location.pathname);
         if (here.kind === 'post') handlePostPage(here);
-        if (here.kind === 'thread') initThreadPage(here);
+        // The archive's chunked view (/board/chunk/123/...) is a page-by-page
+        // reading mode the user picked; it is left as it is. Its links to
+        // posts on other pages go through /board/post/N/ to the thread page,
+        // which is joined here.
+        if (here.kind === 'thread' && here.view === 'thread') initThreadPage(here);
 
         document.addEventListener('mouseover', onMouseOver, true);
         document.addEventListener('mouseout', onMouseOut, true);
